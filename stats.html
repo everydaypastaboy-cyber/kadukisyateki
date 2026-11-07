@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>射的ランキング 集計</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;700&family=Share+Tech+Mono&family=Zen+Kaku+Gothic+New:wght@400;700;900&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <span class="eyebrow">集計</span>
+      <div class="brand-row">
+        <h1><b class="jp">射的</b>ランキング</h1>
+        <span class="live" id="live"><i></i><span id="liveText">接続中</span></span>
+      </div>
+    </div>
+    <div class="tools">
+      <label for="slot">区切り</label>
+      <select id="slot" class="ghost">
+        <option value="60">1時間ごと</option>
+        <option value="30">30分ごと</option>
+      </select>
+      <button class="ghost" id="csvBtn" type="button">CSVで保存</button>
+    </div>
+  </header>
+
+  <section class="kpis" id="kpis"></section>
+  <div id="emptyNote" class="empty-note" hidden>まだ記録がありません。挑戦者が登録されると、時間帯ごとの人数と点数の分布がここに出ます。</div>
+
+  <section class="card" id="distCard" hidden>
+    <h2 id="distTitle">点数の分布（全日）</h2>
+    <div class="hist" id="dist"></div>
+    <div class="hist-x" id="distX"></div>
+  </section>
+
+  <div id="days" class="wrap" style="gap:20px;width:100%"></div>
+  <p class="note">数えているのは「記録を登録した人」です。取り消した記録は入りません。時刻は日本時間です。</p>
+</div>
+
+<script src="config.js"></script>
+<script src="common.js"></script>
+<script>
+(async function () {
+  const { C, Store, fmtNum, dayLabel, daysOf, hourOf } = SKT;
+  const $ = id => document.getElementById(id);
+
+  let records = [];
+
+  // 日本時間の「分」と時刻
+  const JST_MIN = new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Tokyo", minute: "2-digit" });
+  const JST_TIME = new Intl.DateTimeFormat("ja-JP", { timeZone: "Asia/Tokyo", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  const minuteOfDay = at => hourOf(at) * 60 + Number(JST_MIN.format(new Date(at)));
+  const slotLabel = (start, size) => {
+    const h = Math.floor(start / 60), m = start % 60;
+    return size === 60 ? `${h}時` : `${h}:${String(m).padStart(2, "0")}`;
+  };
+  const avg = list => list.length ? (list.reduce((s, x) => s + x.score, 0) / list.length).toFixed(1) + C.unit : "—";
+  const top = list => list.length ? fmtNum(Math.max(...list.map(x => x.score))) + C.unit : "—";
+
+  // 1日分を時間帯ごとに数える（記録のない時間帯も0人として並べる）
+  function bucketsOf(list, size) {
+    if (!list.length) return [];
+    const mins = list.map(x => minuteOfDay(x.at));
+    const first = Math.floor(Math.min(...mins) / size) * size;
+    const last = Math.floor(Math.max(...mins) / size) * size;
+    const out = [];
+    for (let s = first; s <= last; s += size) out.push({ start: s, items: [] });
+    list.forEach((x, i) => { out[(Math.floor(mins[i] / size) * size - first) / size].items.push(x); });
+    return out;
+  }
+
+  // 点数の分布：上限を10等分した区間ごとの人数（区間の幅はきりのいい数に丸める）
+  function distOf(list) {
+    const step = Math.max(1, Math.ceil(C.maxScore / 10));
+    const n = Math.floor(C.maxScore / step) + 1;
+    const bins = Array.from({ length: n }, (_, i) => ({ from: i * step, to: Math.min(C.maxScore, i * step + step - 1), n: 0 }));
+    list.forEach(x => { bins[Math.min(n - 1, Math.floor(x.score / step))].n++; });
+    return bins;
+  }
+
+  // 棒グラフを描く（items: [{label, n, title}]、maxN: 目盛りの最大）
+  function drawBars(hist, xs, items, maxN) {
+    hist.textContent = ""; xs.textContent = "";
+    const peak = Math.max(0, ...items.map(b => b.n));
+    items.forEach(b => {
+      const bar = document.createElement("div");
+      bar.className = "bar" + (b.n === peak && peak > 0 ? " peak" : "");
+      bar.style.height = (b.n / maxN * 100) + "%";
+      bar.title = b.title;
+      const v = document.createElement("b"); v.textContent = b.n || "";
+      bar.append(v);
+      hist.append(bar);
+      const x = document.createElement("span"); x.textContent = b.label;
+      xs.append(x);
+    });
+  }
+
+  function kpi(label, value, sub) {
+    const el = document.createElement("div"); el.className = "kpi";
+    const s = document.createElement("span"); s.textContent = label;
+    const v = document.createElement("strong"); v.textContent = value;
+    el.append(s, v);
+    if (sub) { const e = document.createElement("em"); e.textContent = sub; v.after(e); }
+    return el;
+  }
+
+  function render() {
+    const size = Number($("slot").value);
+    const days = daysOf(records);
+    $("emptyNote").hidden = records.length > 0;
+    $("distCard").hidden = records.length === 0;
+
+    // 全体のまとめ
+    const all = days.map(k => ({ key: k, list: records.filter(x => x.day === k) }));
+    const allBuckets = all.map(d => bucketsOf(d.list, size));
+    let peak = null;
+    all.forEach((d, i) => allBuckets[i].forEach(b => {
+      if (!peak || b.items.length > peak.n) peak = { n: b.items.length, label: `${dayLabel(d.key)} ${slotLabel(b.start, size)}` };
+    }));
+    const k = $("kpis"); k.textContent = "";
+    k.append(
+      kpi("挑戦者（全日）", records.length, "人"),
+      kpi("最高点", top(records)),
+      kpi("平均点", avg(records)),
+      kpi("一番多かった時間帯", peak ? peak.n + "人" : "—", peak ? peak.label : "")
+    );
+
+    // 点数の分布（景品の点数ラインを決めるときの参考に）
+    const bins = distOf(records);
+    drawBars($("dist"), $("distX"),
+      bins.map(b => ({ n: b.n, label: b.from === b.to ? String(b.from) : `${b.from}〜`, title: `${b.from}〜${b.to}${C.unit}: ${b.n}人` })),
+      Math.max(1, ...bins.map(b => b.n)));
+
+    // 日ごとのグラフと表（グラフの高さは全日共通の目盛り）
+    const maxN = Math.max(1, ...allBuckets.flat().map(b => b.items.length));
+    const box = $("days"); box.textContent = "";
+    all.forEach((d, i) => {
+      const buckets = allBuckets[i];
+      const card = document.createElement("section"); card.className = "card";
+      const h = document.createElement("h2");
+      h.textContent = `${i + 1}日目 ${dayLabel(d.key)}　${d.list.length}人・平均 ${avg(d.list)}・最高 ${top(d.list)}`;
+      card.append(h);
+
+      const hist = document.createElement("div"); hist.className = "hist";
+      const xs = document.createElement("div"); xs.className = "hist-x";
+      drawBars(hist, xs, buckets.map(b => ({ n: b.items.length, label: slotLabel(b.start, size), title: `${slotLabel(b.start, size)}〜 ${b.items.length}人` })), maxN);
+      card.append(hist, xs);
+
+      const wrap = document.createElement("div"); wrap.className = "tbl-wrap";
+      const t = document.createElement("table"); t.className = "tbl";
+      t.innerHTML = "<thead><tr><th>時間帯</th><th>挑戦者</th><th>平均点</th><th>最高点</th></tr></thead>";
+      const tb = document.createElement("tbody");
+      buckets.forEach(b => {
+        const tr = document.createElement("tr");
+        [`${slotLabel(b.start, size)}〜`, b.items.length, avg(b.items), top(b.items)]
+          .forEach(v => { const td = document.createElement("td"); td.textContent = v; tr.append(td); });
+        tb.append(tr);
+      });
+      t.append(tb); wrap.append(t); card.append(wrap);
+      box.append(card);
+    });
+  }
+
+  // CSV（Excel で文字化けしないように先頭にBOMを付ける）
+  $("csvBtn").onclick = () => {
+    const rows = [["日付", "時刻", "点数", "匿名", "ニックネーム"]];
+    [...records].sort((a, b) => a.at - b.at).forEach(x => {
+      rows.push([x.day, JST_TIME.format(new Date(x.at)), x.score, x.anon ? "はい" : "", x.anon ? "" : x.name]);
+    });
+    const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\r\n");
+    const url = URL.createObjectURL(new Blob(["﻿" + csv], { type: "text/csv" }));
+    const a = document.createElement("a");
+    a.href = url; a.download = "shateki-ranking.csv";
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  $("slot").onchange = render;
+
+  render();
+  try { await Store.init(); }
+  catch (e) { $("liveText").textContent = "読み込めませんでした。ページを開き直してください"; return; }
+  Store.subscribe(data => { records = data; render(); }, on => {
+    $("live").classList.toggle("on", on);
+    $("liveText").textContent = on ? "LIVE" : "再接続中…";
+  });
+})();
+</script>
+</body>
+</html>
